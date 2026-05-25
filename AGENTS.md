@@ -8,6 +8,7 @@ Telegraph style. Root rules only. Read scoped `AGENTS.md` before touching a subt
 - Replies: repo-root file refs only, e.g. `extensions/telegram/src/index.ts:80`. No absolute paths, no `~/`.
 - CODEOWNERS: maintenance/refactors/tests are ok. For larger behavior, product, security, or ownership-sensitive changes, get a listed owner request/review first.
 - First pass: run docs list (`pnpm docs:list`; ignore if unavailable), then read only relevant docs/guides.
+- Existing-solutions preflight: before proposing or building a custom system, feature, workflow, tool, integration, or automation, do a lightweight check for open-source projects, maintained libraries, existing OpenClaw plugins, or free platforms that already solve it well enough. Prefer those when adequate. Build custom only when existing options are unsuitable, too expensive, unmaintained, unsafe, non-compliant, or Cameron explicitly asks for custom. Avoid paid-service recommendations unless Cameron explicitly approves spend. Keep this to a brief preflight gate, not a broad research assignment.
 - Missing deps: run `pnpm install`, rerun once, then report first actionable error.
 - Use "plugin/plugins" in docs/UI/changelog. `extensions/` remains internal workspace layout.
 - Add channel/plugin/app/doc surface: update `.github/labeler.yml` and matching GitHub labels.
