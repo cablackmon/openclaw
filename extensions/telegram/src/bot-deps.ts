@@ -14,6 +14,7 @@ import { createTelegramDraftStream } from "./draft-stream.js";
 import { resolveTelegramExecApproval } from "./exec-approval-resolver.js";
 import { editMessageTelegram } from "./send.js";
 import { wasSentByBot } from "./sent-message-cache.js";
+import { generateSpeakeasyVoiceNote } from "./speakeasy-voice.js";
 
 export type TelegramBotDeps = {
   loadConfig: typeof loadConfig;
@@ -34,6 +35,7 @@ export type TelegramBotDeps = {
   emitInternalMessageSentHook?: typeof emitInternalMessageSentHook;
   editMessageTelegram?: typeof editMessageTelegram;
   createChannelReplyPipeline?: typeof createChannelReplyPipeline;
+  generateSpeakeasyVoiceNote?: typeof generateSpeakeasyVoiceNote;
 };
 
 export const defaultTelegramBotDeps: TelegramBotDeps = {
@@ -90,5 +92,8 @@ export const defaultTelegramBotDeps: TelegramBotDeps = {
   },
   get createChannelReplyPipeline() {
     return createChannelReplyPipeline;
+  },
+  get generateSpeakeasyVoiceNote() {
+    return generateSpeakeasyVoiceNote;
   },
 };
