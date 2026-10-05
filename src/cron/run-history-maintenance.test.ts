@@ -370,7 +370,7 @@ it("bounds payload reads per batch for a concentrated backlog with large details
     });
     const expected = baselineFingerprint();
     const payloadRows: number[] = [];
-    let settled: string[] = [];
+    const settled: string[] = [];
     for (let more = true; more;) {
       more = runOpenClawStateWriteTransaction(({ db }) => {
         const counter = trackSqliteStatementExecutions(db, ["payload"], (sql) =>
@@ -383,7 +383,7 @@ it("bounds payload reads per batch for a concentrated backlog with large details
             prepareCronRunReceiptWriteSchema(db),
             { limit: 256, exclude: [], settled },
           );
-          settled = [...settled, ...batch.settled];
+          settled.push(...batch.settled);
           payloadRows.push(counter.rowCounts.payload);
           return batch.more;
         } finally {
