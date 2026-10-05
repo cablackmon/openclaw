@@ -11,14 +11,15 @@ import { runOpenClawStateWriteTransaction } from "../state/openclaw-state-db.js"
 import { captureOpenClawStateWorkerContext } from "../state/openclaw-state-worker-context.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { resetCronActiveJobs } from "./active-jobs.js";
+import { pruneCronRunHistoryBatchInDatabase } from "./store/run-history-maintenance.kernel.js";
 import { maintainCronRunHistory } from "./store/run-history.js";
 import {
-  pruneCronRunHistoryBatchInDatabase,
   pruneCronRunHistoryInDatabase,
   readCronRunReconcileCandidatesInDatabase,
   readCronRunRecordsInDatabase,
   reconcileCronRunHistoryInDatabase,
 } from "./store/run-history.kernel.js";
+import type { CronRunOverflowCursor } from "./store/run-history.types.js";
 import { prepareCronRunReceiptWriteSchema } from "./store/run-receipt-write-admission.js";
 
 const HOUR = 60 * 60_000;
@@ -348,13 +349,28 @@ it("bounds payload reads per batch for a concentrated backlog with large details
           endedAt + 7 * DAY,
           JSON.stringify(detail),
         );
-      // One job carries 2,000 retained rows plus a 1,500-row backlog, all with large details.
+      // One job carries 2,000 retained rows plus a 1,508-row backlog, all with large details.
       for (let index = 0; index < 3_500; index += 1) {
         add(`heavy-${index}`, "job-heavy", NOW - HOUR - index * 1_000, {
           kind: "cron-run",
           storeKey: "store",
           summary,
         });
+      }
+      // Legacy undated rows normalize to their last event, so they are the oldest overflow.
+      for (let index = 0; index < 8; index += 1) {
+        const lastEventAt = NOW - 2 * DAY - index * 1_000;
+        insert.run(
+          `undated-${index}`,
+          "job-heavy",
+          `run-undated-${index}`,
+          lastEventAt - 1_000,
+          lastEventAt - 1_000,
+          null,
+          lastEventAt,
+          lastEventAt + 7 * DAY,
+          JSON.stringify({ kind: "cron-run", storeKey: "store", summary }),
+        );
       }
       // Run history and quiet evaluations are separate partitions, each under the cap.
       for (let index = 0; index < 2_400; index += 1) {
@@ -370,30 +386,39 @@ it("bounds payload reads per batch for a concentrated backlog with large details
     });
     const expected = baselineFingerprint();
     const payloadRows: number[] = [];
+    const rankedRows: number[] = [];
     const settled: string[] = [];
+    let cursors: CronRunOverflowCursor[] = [];
     for (let more = true; more;) {
       more = runOpenClawStateWriteTransaction(({ db }) => {
-        const counter = trackSqliteStatementExecutions(db, ["payload"], (sql) =>
-          sql.includes('"detail_json"') ? "payload" : null,
+        const counter = trackSqliteStatementExecutions(db, ["payload", "ranked"], (sql) =>
+          sql.includes('"detail_json"')
+            ? "payload"
+            : sql.includes('"source_id" = ?') && !sql.includes("limit")
+              ? "ranked"
+              : null,
         );
         try {
           const batch = pruneCronRunHistoryBatchInDatabase(
             db,
             NOW,
             prepareCronRunReceiptWriteSchema(db),
-            { limit: 256, exclude: [], settled },
+            { limit: 256, exclude: [], settled, cursors },
           );
           settled.push(...batch.settled);
+          ({ cursors } = batch);
           payloadRows.push(counter.rowCounts.payload);
+          rankedRows.push(counter.rowCounts.ranked);
           return batch.more;
         } finally {
           counter.restore();
         }
       });
     }
-    // Each batch decodes one job's newest 2,000 plus at most a batch and a chunk, not 5,900.
-    expect(Math.max(...payloadRows)).toBeLessThanOrEqual(2_000 + 2 * 256);
-    expect(payloadRows.length).toBe(Math.ceil(1_500 / 256) + 1);
+    // The heavy job is ranked once, continued by index-ordered scans that rank nothing and
+    // decode only the rows they delete, then ranked once more, without its backlog, to settle.
+    expect(rankedRows).toEqual([3_508, 0, 0, 0, 0, 2_000, 2_400]);
+    expect(payloadRows).toEqual([2_304, 264, 256, 256, 256, 229, 1_024]);
     expect(settled).toEqual(["job-heavy", "job-split"]);
     expect(runOpenClawStateWriteTransaction(({ db }) => fingerprint(db))).toEqual(expected);
     const remaining = runOpenClawStateWriteTransaction(({ db }) =>
@@ -413,14 +438,22 @@ it("bounds payload reads per batch for a concentrated backlog with large details
 
 it("keeps every maintenance select on its narrow index without table statistics", async () => {
   await withOpenClawTestState({ layout: "state-only", prefix: "cron-history-plan-" }, async () => {
-    seed({ retained: 20, expired: 20, capExtra: 1 });
+    seed({ retained: 20, expired: 20, capExtra: 3 });
     runOpenClawStateWriteTransaction(({ db }) => {
       const observation = observeSqliteReadSql(StatementSync.prototype);
       try {
         readCronRunReconcileCandidatesInDatabase(db);
-        pruneCronRunHistoryBatchInDatabase(db, NOW, prepareCronRunReceiptWriteSchema(db), {
+        const schema = prepareCronRunReceiptWriteSchema(db);
+        // A full first batch leaves a cursor, so the second batch runs the overflow scan.
+        const { cursors } = pruneCronRunHistoryBatchInDatabase(db, NOW, schema, {
+          limit: 1,
+          exclude: ["excluded"],
+        });
+        expect(cursors).toHaveLength(1);
+        pruneCronRunHistoryBatchInDatabase(db, NOW, schema, {
           limit: 1_000,
           exclude: ["excluded"],
+          cursors,
         });
       } finally {
         observation.restore();
@@ -439,6 +472,8 @@ it("keeps every maintenance select on its narrow index without table statistics"
         cappedJobs: planFor('group by "source_id"'),
         cappedRows: planFor('"source_id" = ?'),
         cappedDetails: planFor('select "task_id", "detail_json"'),
+        undatedScan: planFor('"ended_at" is null'),
+        datedScan: planFor('"ended_at" <= ?'),
         expired: planFor('"cleanup_after" <='),
         lost: planFor('"status" = ?'),
         undated: planFor('"cleanup_after" is null'),
@@ -448,12 +483,22 @@ it("keeps every maintenance select on its narrow index without table statistics"
         cappedJobs: expect.stringContaining("COVERING INDEX idx_task_runs_runtime_source_ended"),
         cappedRows: expect.stringContaining("idx_task_runs_runtime_source_ended (runtime=? AND"),
         cappedDetails: expect.stringContaining("sqlite_autoindex_task_runs_1 (task_id=?)"),
+        undatedScan: expect.stringContaining(
+          "idx_task_runs_runtime_source_ended (runtime=? AND source_id=? AND ended_at=?)",
+        ),
+        datedScan: expect.stringContaining(
+          "idx_task_runs_runtime_source_ended (runtime=? AND source_id=? AND ended_at<?)",
+        ),
         expired: expect.stringContaining("idx_task_runs_cleanup_after (cleanup_after<?)"),
         lost: expect.stringContaining("idx_task_runs_runtime_status (runtime=? AND status=?)"),
         undated: expect.stringContaining("idx_task_runs_cleanup_after (cleanup_after=?)"),
       });
       expect(plans.filter(({ plan }) => /SCAN task_runs(?! USING COVERING)/.test(plan))).toEqual(
         [],
+      );
+      // The overflow scan reads in index order, so continuing a job never sorts its backlog.
+      expect([planFor('"ended_at" is null'), planFor('"ended_at" <= ?')]).not.toContainEqual(
+        expect.stringContaining("TEMP B-TREE"),
       );
     });
   });

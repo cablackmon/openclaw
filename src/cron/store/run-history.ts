@@ -4,7 +4,7 @@ import type { OpenClawStateWorkerContext } from "../../state/openclaw-state-work
 import { runOpenClawStateWorkerOperation } from "../../state/openclaw-state-worker-store.js";
 import { isCronJobActive } from "../active-jobs.js";
 import { runCronRuntimeMutation } from "../service/runtime-mutation.js";
-import type { CronRunHistoryWrite } from "./run-history.types.js";
+import type { CronRunHistoryWrite, CronRunOverflowCursor } from "./run-history.types.js";
 import { isCronRunReceiptOwnerStale } from "./run-receipt-store.js";
 import type { CronRuntimeMutationContracts } from "./runtime-mutation.types.js";
 
@@ -32,15 +32,18 @@ export async function maintainCronRunHistory(
   const budgetMs = options.budgetMs ?? CRON_HISTORY_MAINTENANCE_BUDGET_MS;
   const reconciled: string[] = [];
   const settled: string[] = [];
+  let cursors: CronRunOverflowCursor[] = [];
   for (let first = true; ; first = false) {
     const outcome = await runCronHistoryMaintenanceBatch(context, assertCurrent, {
       reconcile: first,
       exclude: reconciled,
       settled,
+      cursors,
       limit: options.batchSize ?? CRON_HISTORY_MAINTENANCE_BATCH,
     });
     reconciled.push(...outcome.reconciled);
     settled.push(...outcome.settled);
+    ({ cursors } = outcome);
     if (!outcome.more || options.signal?.aborted || performance.now() - startedAt >= budgetMs) {
       return;
     }

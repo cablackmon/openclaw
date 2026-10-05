@@ -19,16 +19,15 @@ import {
 import type { CronRunHistoryWrite, CronRunRecord } from "./run-history.types.js";
 import type { CronRunReceiptWriteSchema } from "./run-receipt-write-admission.js";
 
-type CronRunHistoryDatabase = Pick<DB, "task_runs" | "execution_owner_lifecycle_bindings">;
+export type CronRunHistoryDatabase = Pick<DB, "task_runs" | "execution_owner_lifecycle_bindings">;
 const query = (db: DatabaseSync) => getNodeSqliteKysely<CronRunHistoryDatabase>(db);
-const RETENTION_MS = 7 * 24 * 60 * 60_000;
-const LOST_RETENTION_MS = 24 * 60 * 60_000;
-const CRON_HISTORY_KEEP_PER_JOB = 2000;
-const CRON_HISTORY_DETAIL_CHUNK = 256;
+export const RETENTION_MS = 7 * 24 * 60 * 60_000;
+export const LOST_RETENTION_MS = 24 * 60 * 60_000;
+export const CRON_HISTORY_KEEP_PER_JOB = 2000;
 
 const SCOPE_KINDS = ["session", "system"];
 const TERMINAL_OUTCOMES = ["succeeded", "blocked"];
-const TERMINAL_STATUSES = ["succeeded", "failed", "timed_out", "cancelled"];
+export const TERMINAL_STATUSES = ["succeeded", "failed", "timed_out", "cancelled"];
 const STATUSES = ["queued", "running", ...TERMINAL_STATUSES, "lost"];
 const DELIVERY_STATUSES = [
   "pending",
@@ -70,7 +69,7 @@ function validateRetainedEnum(value: string, allowed: readonly string[], label: 
 }
 
 /** Maintenance selects only rows that row admission would accept; others stay for doctor. */
-function admittedCronRow(eb: ExpressionBuilder<CronRunHistoryDatabase, "task_runs">) {
+export function admittedCronRow(eb: ExpressionBuilder<CronRunHistoryDatabase, "task_runs">) {
   return eb.and([
     eb("scope_kind", "in", SCOPE_KINDS),
     eb("delivery_status", "in", DELIVERY_STATUSES),
@@ -84,10 +83,10 @@ function admittedCronRow(eb: ExpressionBuilder<CronRunHistoryDatabase, "task_run
 
 // Unary plus keeps SQLite on the cleanup_after or run_id index. Without statistics it
 // otherwise picks (runtime, status) and walks every Cron row for each batch.
-const unindexedRuntime = /* kysely-allow-raw: query-plan pin */ sql<string>`+runtime`;
-const unindexedStatus = /* kysely-allow-raw: query-plan pin */ sql<string>`+status`;
+export const unindexedRuntime = /* kysely-allow-raw: query-plan pin */ sql<string>`+runtime`;
+export const unindexedStatus = /* kysely-allow-raw: query-plan pin */ sql<string>`+status`;
 
-function normalizeCronRunTimestamps(record: CronRunRecord): CronRunRecord {
+export function normalizeCronRunTimestamps(record: CronRunRecord): CronRunRecord {
   const originalCreatedAt = record.createdAt;
   let createdAt = originalCreatedAt;
   let startedAt = record.startedAt;
@@ -265,7 +264,7 @@ export function recordCronRunInDatabase(db: DatabaseSync, input: CronRunHistoryW
 }
 
 /** Retention partitions keep job history, quiet evaluations, and store keys apart. */
-function cronRunRetentionPartition(row: CronRunRecord): string {
+export function cronRunRetentionPartition(row: CronRunRecord): string {
   return JSON.stringify([
     cronRunRecordStoreKey(row),
     row.jobId,
@@ -317,7 +316,7 @@ function collectExpiredCronRunIds(records: readonly CronRunRecord[], now: number
   return expired;
 }
 
-function deleteCronRunRowsInDatabase(
+export function deleteCronRunRowsInDatabase(
   db: DatabaseSync,
   schema: CronRunReceiptWriteSchema,
   ids: readonly string[],
@@ -352,207 +351,6 @@ export function pruneCronRunHistoryInDatabase(
   const ids = [...collectExpiredCronRunIds(records, now)];
   deleteCronRunRowsInDatabase(db, schema, ids);
   return ids.length;
-}
-
-// The terminal timestamp normalizeCronRunTimestamps derives for a stored non-active row.
-const storedCronRunTimestamp =
-  /* kysely-allow-raw: retention evaluates the normalized record timestamp without decoding rows. */
-  sql<number>`max(coalesce(ended_at, last_event_at, created_at), coalesce(started_at, ended_at, last_event_at, created_at))`;
-const lostCronRunExpiry =
-  /* kysely-allow-raw: lost-row expiry mirrors collectExpiredCronRunIds without decoding rows. */
-  sql<number>`min(coalesce(cleanup_after, ${storedCronRunTimestamp} + ${LOST_RETENTION_MS}), ${storedCronRunTimestamp} + ${LOST_RETENTION_MS})`;
-const undatedCronRunExpiry =
-  /* kysely-allow-raw: released rows without cleanup_after expire from their normalized timestamp. */
-  sql<number>`${storedCronRunTimestamp} + ${RETENTION_MS}`;
-
-type CronRunRowFilter = (
-  eb: ExpressionBuilder<CronRunHistoryDatabase, "task_runs">,
-) => ReturnType<typeof admittedCronRow>;
-
-/**
- * Up to `limit` cap-overflow ids for one job. Ranking reads only timestamp columns; the
- * newest-first walk then decodes payloads a chunk at a time, only until `limit` rows are
- * found or the unread rows can no longer push any partition past the cap. Payload work per
- * call is bounded by the cap per partition plus `limit`, not by the job's backlog. Returns
- * undefined, having decoded nothing, when the job needs payloads and `decode` is false.
- */
-function collectCronRunCapOverflowBatch(
-  db: DatabaseSync,
-  jobId: string,
-  excluded: CronRunRowFilter,
-  limit: number,
-  decode: boolean,
-): { overflow: string[]; decoded: number } | undefined {
-  const ordered = executeSqliteQuerySync(
-    db,
-    query(db)
-      .selectFrom("task_runs")
-      .select(["task_id", "status", "created_at", "started_at", "ended_at", "last_event_at"])
-      .where("runtime", "=", "cron")
-      .where("source_id", "=", jobId)
-      .where(unindexedStatus, "in", TERMINAL_STATUSES)
-      .where(admittedCronRow)
-      .where(excluded),
-  )
-    .rows.map((row) =>
-      normalizeCronRunTimestamps({
-        id: row.task_id,
-        jobId,
-        createdAt: normalizeSqliteNumber(row.created_at) ?? 0,
-        startedAt: normalizeSqliteNumber(row.started_at),
-        endedAt: normalizeSqliteNumber(row.ended_at),
-        lastEventAt: normalizeSqliteNumber(row.last_event_at),
-        status: row.status,
-      }),
-    )
-    .toSorted(compareCronRunRecordsNewestFirst);
-  if (ordered.length <= CRON_HISTORY_KEEP_PER_JOB) {
-    return { overflow: [], decoded: 0 };
-  }
-  if (!decode) {
-    return undefined;
-  }
-  const counts = new Map<string, number>();
-  let largest = 0;
-  let offset = 0;
-  const overflow: string[] = [];
-  // An unseen partition gains at most the unread rows; a seen one cannot pass largest + unread.
-  while (
-    overflow.length < limit &&
-    offset < ordered.length &&
-    largest + ordered.length - offset > CRON_HISTORY_KEEP_PER_JOB
-  ) {
-    const chunk = ordered.slice(offset, offset + CRON_HISTORY_DETAIL_CHUNK);
-    offset += chunk.length;
-    const details = new Map(
-      executeSqliteQuerySync(
-        db,
-        query(db)
-          .selectFrom("task_runs")
-          .select(["task_id", "detail_json"])
-          .where("task_id", "in", sqliteStringSet(chunk.map((row) => row.id))),
-      ).rows.map((row) => [row.task_id, row.detail_json]),
-    );
-    for (const row of chunk) {
-      const detailJson = details.get(row.id) ?? null;
-      const key = cronRunRetentionPartition({
-        ...row,
-        detail: detailJson === null ? undefined : parseCronRunDetailJson(detailJson),
-      });
-      const count = (counts.get(key) ?? 0) + 1;
-      counts.set(key, count);
-      largest = Math.max(largest, count);
-      if (count > CRON_HISTORY_KEEP_PER_JOB && overflow.push(row.id) >= limit) {
-        break;
-      }
-    }
-  }
-  return { overflow, decoded: offset };
-}
-
-/**
- * Deletes at most `limit` expired rows inside the caller's transaction. Per-partition
- * overflow goes first, ranked as in pruneCronRunHistoryInDatabase; time expiry then
- * follows cleanup_after, oldest first. Jobs in `settled` had no overflow left earlier in
- * this sweep and are not walked again. Only admitted rows with known statuses are
- * selected, so rows the kernel cannot decode stay in place instead of failing the sweep.
- */
-export function pruneCronRunHistoryBatchInDatabase(
-  db: DatabaseSync,
-  now: number,
-  schema: CronRunReceiptWriteSchema,
-  options: { limit: number; exclude: readonly string[]; settled?: readonly string[] },
-): { pruned: number; more: boolean; settled: string[] } {
-  const { limit, exclude } = options;
-  const skipped = new Set(options.settled);
-  const excluded: CronRunRowFilter = (eb) =>
-    exclude.length === 0 ? eb.and([]) : eb("task_id", "not in", sqliteStringSet(exclude));
-  // The (runtime, source_id, ...) index covers this count, so it never reads row payloads.
-  const cappedJobIds = executeSqliteQuerySync(
-    db,
-    query(db)
-      .selectFrom("task_runs")
-      .select("source_id")
-      .where("runtime", "=", "cron")
-      .where("source_id", "is not", null)
-      .where("source_id", "!=", "")
-      .groupBy("source_id")
-      .having((eb) => eb.fn.countAll(), ">", CRON_HISTORY_KEEP_PER_JOB),
-  ).rows.flatMap((row) => (row.source_id && !skipped.has(row.source_id) ? [row.source_id] : []));
-  const ids: string[] = [];
-  const settled: string[] = [];
-  let decoded = 0;
-  let deferred = false;
-  for (const jobId of cappedJobIds) {
-    if (ids.length >= limit) {
-      break;
-    }
-    const wanted = limit - ids.length;
-    // Each batch decodes at most one job's payloads; the next job waits for the next batch.
-    const walk = collectCronRunCapOverflowBatch(db, jobId, excluded, wanted, decoded === 0);
-    if (!walk) {
-      deferred = true;
-      break;
-    }
-    decoded += walk.decoded;
-    ids.push(...walk.overflow);
-    // Deleting overflow never changes another row's rank, so a short walk drains the job.
-    if (walk.overflow.length < wanted) {
-      settled.push(jobId);
-    }
-  }
-  const expirySelects = [
-    () =>
-      query(db)
-        .selectFrom("task_runs")
-        .select("task_id")
-        .where("cleanup_after", "<=", now)
-        .where(unindexedRuntime, "=", "cron")
-        .where(unindexedStatus, "in", TERMINAL_STATUSES)
-        .where(admittedCronRow)
-        .where(excluded)
-        .orderBy("cleanup_after", "asc")
-        .orderBy("task_id", "asc"),
-    () =>
-      query(db)
-        .selectFrom("task_runs")
-        .select("task_id")
-        .where("runtime", "=", "cron")
-        .where("status", "=", "lost")
-        .where(lostCronRunExpiry, "<=", now)
-        .where(admittedCronRow)
-        .where(excluded)
-        .orderBy(storedCronRunTimestamp, "asc")
-        .orderBy("task_id", "asc"),
-    () =>
-      query(db)
-        .selectFrom("task_runs")
-        .select("task_id")
-        .where("cleanup_after", "is", null)
-        .where(unindexedRuntime, "=", "cron")
-        .where(unindexedStatus, "in", TERMINAL_STATUSES)
-        .where(undatedCronRunExpiry, "<=", now)
-        .where(admittedCronRow)
-        .where(excluded)
-        .orderBy(storedCronRunTimestamp, "asc")
-        .orderBy("task_id", "asc"),
-  ];
-  // Time expiry starts only after every capped job has been walked and its overflow removed.
-  for (const select of expirySelects) {
-    if (deferred || ids.length >= limit) {
-      break;
-    }
-    // Overflow rows may also be expired; skip them rather than shrinking the batch.
-    const taken = new Set(ids);
-    ids.push(
-      ...executeSqliteQuerySync(db, select().limit(limit - ids.length + taken.size))
-        .rows.map((row) => row.task_id)
-        .filter((id) => !taken.has(id))
-        .slice(0, limit - ids.length),
-    );
-  }
-  deleteCronRunRowsInDatabase(db, schema, ids);
-  return { pruned: ids.length, more: deferred || ids.length >= limit, settled };
 }
 
 /** Caller holds the transaction and retains live job/receipt decisions through commit. */

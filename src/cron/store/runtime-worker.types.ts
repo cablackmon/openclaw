@@ -7,6 +7,7 @@ import type {
   CronStoreFile,
 } from "../types.js";
 import type { CronJobFamilyIdentity } from "./row-codec.js";
+import type { CronRunOverflowCursor } from "./run-history.types.js";
 import type {
   CronRunReceipt,
   CronRunReceiptHandle,
@@ -158,6 +159,8 @@ export type CronRuntimeMutationInputs = {
     exclude: string[];
     /** Jobs an earlier batch drained of cap overflow; later batches skip walking them. */
     settled: string[];
+    /** Over-cap jobs an earlier batch ranked; later batches continue them without re-ranking. */
+    cursors: CronRunOverflowCursor[];
     limit: number;
   };
   "cron.activateRun": {

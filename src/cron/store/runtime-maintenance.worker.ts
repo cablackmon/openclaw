@@ -4,8 +4,8 @@ import { runOpenClawStateWriteTransaction } from "../../state/openclaw-state-db.
 import { recomputeSingleJobForMaintenance } from "../service/jobs-scheduling.js";
 import type { CronJobPolicyContext } from "../service/state.js";
 import { loadedCronStoreFromRows, loadCronRows, updateCronRuntimeRow } from "./row-codec.js";
+import { pruneCronRunHistoryBatchInDatabase } from "./run-history-maintenance.kernel.js";
 import {
-  pruneCronRunHistoryBatchInDatabase,
   readCronRunReconcileCandidatesInDatabase,
   reconcileCronRunHistoryInDatabase,
 } from "./run-history.kernel.js";
@@ -59,17 +59,23 @@ export function maintainCronRunHistoryInWorker(
         new Set(preparation.protectedJobIds),
       );
       // Newly lost rows retain their first lost observation until the next sweep, as before.
-      const { pruned, more, settled } = pruneCronRunHistoryBatchInDatabase(
+      const { pruned, more, settled, cursors } = pruneCronRunHistoryBatchInDatabase(
         db,
         preparation.nowMs,
         schema,
-        { limit: input.limit, exclude: [...input.exclude, ...reconciled], settled: input.settled },
+        {
+          limit: input.limit,
+          exclude: [...input.exclude, ...reconciled],
+          settled: input.settled,
+          cursors: input.cursors,
+        },
       );
       return retainCronRuntimeMutationOutcome("cron.maintainHistory", db, input.nonce, {
         reconciled: [...reconciled],
         pruned,
         more,
         settled,
+        cursors,
       });
     },
     { database, path: database.path, env: getSqliteWorkerStateContext().environment },
