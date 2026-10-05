@@ -156,6 +156,8 @@ export type CronRuntimeMutationInputs = {
     /** Only a sweep's first batch reconciles; later batches skip rows it reconciled. */
     reconcile: boolean;
     exclude: string[];
+    /** Jobs an earlier batch drained of cap overflow; later batches skip walking them. */
+    settled: string[];
     limit: number;
   };
   "cron.activateRun": {

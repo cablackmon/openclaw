@@ -2,7 +2,10 @@ import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { StatementSync } from "node:sqlite";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { observeSqliteReadSql } from "../../test/helpers/sqlite-statement-execution-counter.js";
+import {
+  observeSqliteReadSql,
+  trackSqliteStatementExecutions,
+} from "../../test/helpers/sqlite-statement-execution-counter.js";
 import * as operationAdmission from "../infra/sqlite-worker-operation-admission.js";
 import { runOpenClawStateWriteTransaction } from "../state/openclaw-state-db.js";
 import { captureOpenClawStateWorkerContext } from "../state/openclaw-state-worker-context.js";
@@ -325,6 +328,89 @@ it("keeps committed batches when a later batch fails and resumes on the next swe
   });
 });
 
+it("bounds payload reads per batch for a concentrated backlog with large details", async () => {
+  await withOpenClawTestState({ layout: "state-only", prefix: "cron-history-heavy-" }, async () => {
+    const summary = "x".repeat(4_096);
+    runOpenClawStateWriteTransaction(({ db }) => {
+      db.exec("DELETE FROM task_runs");
+      const insert = db.prepare(
+        "INSERT INTO task_runs (task_id, runtime, source_id, run_id, owner_key, scope_kind, task, delivery_status, notify_policy, created_at, started_at, ended_at, last_event_at, cleanup_after, status, detail_json) VALUES (?, 'cron', ?, ?, '', 'system', 'job', 'not_applicable', 'silent', ?, ?, ?, ?, ?, 'succeeded', ?)",
+      );
+      const add = (id: string, job: string, endedAt: number, detail: unknown) =>
+        insert.run(
+          id,
+          job,
+          `run-${id}`,
+          endedAt - 1_000,
+          endedAt - 1_000,
+          endedAt,
+          endedAt,
+          endedAt + 7 * DAY,
+          JSON.stringify(detail),
+        );
+      // One job carries 2,000 retained rows plus a 1,500-row backlog, all with large details.
+      for (let index = 0; index < 3_500; index += 1) {
+        add(`heavy-${index}`, "job-heavy", NOW - HOUR - index * 1_000, {
+          kind: "cron-run",
+          storeKey: "store",
+          summary,
+        });
+      }
+      // Run history and quiet evaluations are separate partitions, each under the cap.
+      for (let index = 0; index < 2_400; index += 1) {
+        add(
+          `split-${index}`,
+          "job-split",
+          NOW - HOUR - index * 1_000,
+          index % 2 === 0
+            ? { kind: "cron-run", storeKey: "store", summary }
+            : { storeKey: "store", triggerFired: false, triggerStateChanged: false },
+        );
+      }
+    });
+    const expected = baselineFingerprint();
+    const payloadRows: number[] = [];
+    let settled: string[] = [];
+    for (let more = true; more;) {
+      more = runOpenClawStateWriteTransaction(({ db }) => {
+        const counter = trackSqliteStatementExecutions(db, ["payload"], (sql) =>
+          sql.includes('"detail_json"') ? "payload" : null,
+        );
+        try {
+          const batch = pruneCronRunHistoryBatchInDatabase(
+            db,
+            NOW,
+            prepareCronRunReceiptWriteSchema(db),
+            { limit: 256, exclude: [], settled },
+          );
+          settled = [...settled, ...batch.settled];
+          payloadRows.push(counter.rowCounts.payload);
+          return batch.more;
+        } finally {
+          counter.restore();
+        }
+      });
+    }
+    // Each batch decodes one job's newest 2,000 plus at most a batch and a chunk, not 5,900.
+    expect(Math.max(...payloadRows)).toBeLessThanOrEqual(2_000 + 2 * 256);
+    expect(payloadRows.length).toBe(Math.ceil(1_500 / 256) + 1);
+    expect(settled).toEqual(["job-heavy", "job-split"]);
+    expect(runOpenClawStateWriteTransaction(({ db }) => fingerprint(db))).toEqual(expected);
+    const remaining = runOpenClawStateWriteTransaction(({ db }) =>
+      db
+        .prepare(
+          "SELECT source_id, count(*) AS count, min(ended_at) AS oldest FROM task_runs GROUP BY source_id ORDER BY source_id",
+        )
+        .all(),
+    );
+    expect(remaining).toEqual([
+      // Only the backlog left: the heavy job keeps exactly its newest 2,000 rows.
+      { source_id: "job-heavy", count: 2_000, oldest: NOW - HOUR - 1_999 * 1_000 },
+      { source_id: "job-split", count: 2_400, oldest: NOW - HOUR - 2_399 * 1_000 },
+    ]);
+  });
+});
+
 it("keeps every maintenance select on its narrow index without table statistics", async () => {
   await withOpenClawTestState({ layout: "state-only", prefix: "cron-history-plan-" }, async () => {
     seed({ retained: 20, expired: 20, capExtra: 1 });
@@ -352,6 +438,7 @@ it("keeps every maintenance select on its narrow index without table statistics"
         sharedRuns: planFor('"run_id" in'),
         cappedJobs: planFor('group by "source_id"'),
         cappedRows: planFor('"source_id" = ?'),
+        cappedDetails: planFor('select "task_id", "detail_json"'),
         expired: planFor('"cleanup_after" <='),
         lost: planFor('"status" = ?'),
         undated: planFor('"cleanup_after" is null'),
@@ -360,6 +447,7 @@ it("keeps every maintenance select on its narrow index without table statistics"
         sharedRuns: expect.stringContaining("idx_task_runs_run_id (run_id=?)"),
         cappedJobs: expect.stringContaining("COVERING INDEX idx_task_runs_runtime_source_ended"),
         cappedRows: expect.stringContaining("idx_task_runs_runtime_source_ended (runtime=? AND"),
+        cappedDetails: expect.stringContaining("sqlite_autoindex_task_runs_1 (task_id=?)"),
         expired: expect.stringContaining("idx_task_runs_cleanup_after (cleanup_after<?)"),
         lost: expect.stringContaining("idx_task_runs_runtime_status (runtime=? AND status=?)"),
         undated: expect.stringContaining("idx_task_runs_cleanup_after (cleanup_after=?)"),

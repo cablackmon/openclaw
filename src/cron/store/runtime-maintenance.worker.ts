@@ -59,14 +59,17 @@ export function maintainCronRunHistoryInWorker(
         new Set(preparation.protectedJobIds),
       );
       // Newly lost rows retain their first lost observation until the next sweep, as before.
-      const { pruned, more } = pruneCronRunHistoryBatchInDatabase(db, preparation.nowMs, schema, {
-        limit: input.limit,
-        exclude: [...input.exclude, ...reconciled],
-      });
+      const { pruned, more, settled } = pruneCronRunHistoryBatchInDatabase(
+        db,
+        preparation.nowMs,
+        schema,
+        { limit: input.limit, exclude: [...input.exclude, ...reconciled], settled: input.settled },
+      );
       return retainCronRuntimeMutationOutcome("cron.maintainHistory", db, input.nonce, {
         reconciled: [...reconciled],
         pruned,
         more,
+        settled,
       });
     },
     { database, path: database.path, env: getSqliteWorkerStateContext().environment },

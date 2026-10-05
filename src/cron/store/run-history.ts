@@ -31,13 +31,16 @@ export async function maintainCronRunHistory(
   const startedAt = performance.now();
   const budgetMs = options.budgetMs ?? CRON_HISTORY_MAINTENANCE_BUDGET_MS;
   const reconciled: string[] = [];
+  const settled: string[] = [];
   for (let first = true; ; first = false) {
     const outcome = await runCronHistoryMaintenanceBatch(context, assertCurrent, {
       reconcile: first,
       exclude: reconciled,
+      settled,
       limit: options.batchSize ?? CRON_HISTORY_MAINTENANCE_BATCH,
     });
     reconciled.push(...outcome.reconciled);
+    settled.push(...outcome.settled);
     if (!outcome.more || options.signal?.aborted || performance.now() - startedAt >= budgetMs) {
       return;
     }
