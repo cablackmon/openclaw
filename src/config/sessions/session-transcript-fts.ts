@@ -250,6 +250,46 @@ export function deleteSessionTranscriptFtsRowsInTransaction(
   );
 }
 
+/**
+ * Delete one session's FTS rows within a row and text-byte budget. Each FTS delete re-tokenizes
+ * its stored text, so bytes bound the native cost; the first row is always taken.
+ */
+export function deleteSessionTranscriptFtsRowsWithinBudgetInTransaction(
+  db: EngineConnection,
+  sessionId: string,
+  budget: { maxRows: number; maxBytes: number },
+): { deletedRows: number; exhausted: boolean } {
+  const kysely = getNodeSqliteKysely<TranscriptFtsDatabase>(db);
+  const candidates = executeSqliteQuerySync(
+    db,
+    kysely
+      .selectFrom("session_transcript_fts_rows as row")
+      .leftJoin("session_transcript_fts as fts", "fts.rowid", "row.id")
+      .select(["row.id", sql<number | null>`octet_length(fts.text)`.as("bytes")])
+      .where("row.session_id", "=", sessionId)
+      // Any order drains a dirty projection; ordering by id would sort every remaining row.
+      .limit(budget.maxRows + 1),
+  ).rows;
+  const ids: number[] = [];
+  let bytes = 0;
+  for (const candidate of candidates.slice(0, budget.maxRows)) {
+    bytes += candidate.bytes ?? 0;
+    if (ids.length > 0 && bytes > budget.maxBytes) {
+      break;
+    }
+    ids.push(candidate.id);
+  }
+  if (ids.length > 0) {
+    withSqliteDatabaseWriteScope(db, [sqliteSessionIdWriteScope(sessionId)], () =>
+      executeSqliteQuerySync(
+        db,
+        kysely.deleteFrom("session_transcript_fts_rows").where("id", "in", ids),
+      ),
+    );
+  }
+  return { deletedRows: ids.length, exhausted: ids.length === candidates.length };
+}
+
 /** Stream only one session's FTS content without scanning other sessions' payloads. */
 export function selectSessionTranscriptFtsRows(db: EngineConnection, sessionId: string) {
   const kysely = getNodeSqliteKysely<TranscriptFtsDatabase>(db);
