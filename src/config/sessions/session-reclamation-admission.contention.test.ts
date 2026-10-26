@@ -2,7 +2,6 @@ import { channel } from "node:diagnostics_channel";
 import fs from "node:fs/promises";
 import { monitorEventLoopDelay, performance } from "node:perf_hooks";
 import { expect, test } from "vitest";
-import type { SqliteWritePhase } from "../../infra/sqlite-write-phase-observer.js";
 import {
   openOpenClawAgentDatabase,
   runOpenClawAgentWriteTransaction,
@@ -37,7 +36,7 @@ type SessionWriteEvent = {
   elapsedMs: number;
   queueWaitMs?: number;
   writerExecutionMs?: number;
-  admissionPhasesMs?: Record<SqliteWritePhase, number>;
+  admissionPhasesMs?: Record<string, number>;
   nativeTransactionMs?: number;
   nativeTransactionOpenAtRelease?: boolean;
 };
@@ -105,7 +104,7 @@ test("reclamation grants partition their writer hold while foreground writers co
     const collectReservation = (event: unknown) =>
       reservations.push(event as (typeof reservations)[number]);
     reservationDiagnostics.subscribe(collectReservation);
-    let running = true;
+    const foregroundRunning = { current: true };
     const foregroundLatencyMs: Record<"baseline" | "contended", number[]> = {
       baseline: [],
       contended: [],
@@ -113,7 +112,7 @@ test("reclamation grants partition their writer hold while foreground writers co
     let window: keyof typeof foregroundLatencyMs = "baseline";
     const foreground = foregroundScopes.map(async (resolved, writerIndex) => {
       let revision = 0;
-      while (running) {
+      while (foregroundRunning.current) {
         const startedAt = performance.now();
         await runExclusiveSqliteSessionWrite(
           resolved,
@@ -131,11 +130,15 @@ test("reclamation grants partition their writer hold while foreground writers co
         );
         foregroundLatencyMs[window].push(performance.now() - startedAt);
         // Foreground cadence: one short write per writer every ~5 ms.
-        await new Promise((resolve) => setTimeout(resolve, 5));
+        await new Promise((resolve) => {
+          setTimeout(resolve, 5);
+        });
       }
     });
     try {
-      await new Promise((resolve) => setTimeout(resolve, scale.baselineMs));
+      await new Promise((resolve) => {
+        setTimeout(resolve, scale.baselineMs);
+      });
       window = "contended";
       // Separates main-thread blocking from writer-lane holds in the foreground latency.
       const loopDelay = monitorEventLoopDelay({ resolution: 5 });
@@ -161,7 +164,7 @@ test("reclamation grants partition their writer hold while foreground writers co
         p99: loopDelay.percentile(99) / 1e6,
         max: loopDelay.max / 1e6,
       };
-      running = false;
+      foregroundRunning.current = false;
       await Promise.all(foreground);
 
       const grants = events.filter((event) => event.writer === "worker" && event.admissionPhasesMs);
@@ -182,14 +185,7 @@ test("reclamation grants partition their writer hold while foreground writers co
         expect(loadSessionEntry(resolved)?.label).toMatch(/^revision-\d+$/);
       }
       if (reportPath) {
-        const phases: SqliteWritePhase[] = [
-          "lease-prepare",
-          "open",
-          "schema",
-          "mutation",
-          "commit",
-          "release",
-        ];
+        const phases = ["lease-prepare", "open", "schema", "mutation", "commit", "release"];
         const report = {
           scale,
           reclamationMs,
@@ -270,7 +266,7 @@ test("reclamation grants partition their writer hold while foreground writers co
         await fs.writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
       }
     } finally {
-      running = false;
+      foregroundRunning.current = false;
       await Promise.allSettled(foreground);
       diagnostics.unsubscribe(collect);
       reservationDiagnostics.unsubscribe(collectReservation);

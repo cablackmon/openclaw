@@ -1,3 +1,4 @@
+import { sql } from "kysely";
 import { executeSqliteQuerySync, getNodeSqliteKysely } from "../../infra/kysely-sync.js";
 import type { EngineConnection } from "../../infra/sql-connection.js";
 import {
@@ -5,10 +6,52 @@ import {
   withSqliteDatabaseWriteScope,
 } from "../../infra/sqlite-database-admission.js";
 import type { DB } from "../../state/openclaw-agent-db.generated.js";
-import { deleteSessionTranscriptFtsRowsWithinBudgetInTransaction } from "./session-transcript-fts.js";
 import { markSessionTranscriptIndexDirtyInTransaction } from "./session-transcript-index.js";
 
-type TranscriptIndexDrainDatabase = Pick<DB, "session_transcript_active_events">;
+type TranscriptIndexDrainDatabase = Pick<
+  DB,
+  "session_transcript_active_events" | "session_transcript_fts_rows"
+> & { session_transcript_fts: { rowid: number; text: string | null } };
+
+/**
+ * Delete one session's FTS rows within a row and text-byte budget. Each FTS delete re-tokenizes
+ * its stored text, so bytes bound the native cost; the first row is always taken.
+ */
+function deleteSessionTranscriptFtsRowsWithinBudget(
+  db: EngineConnection,
+  sessionId: string,
+  budget: { maxRows: number; maxBytes: number },
+): { deletedRows: number; exhausted: boolean } {
+  const kysely = getNodeSqliteKysely<TranscriptIndexDrainDatabase>(db);
+  const candidates = executeSqliteQuerySync(
+    db,
+    kysely
+      .selectFrom("session_transcript_fts_rows as row")
+      .leftJoin("session_transcript_fts as fts", "fts.rowid", "row.id")
+      .select(["row.id", sql<number | null>`octet_length(fts.text)`.as("bytes")])
+      .where("row.session_id", "=", sessionId)
+      // Any order drains a dirty projection; ordering by id would sort every remaining row.
+      .limit(budget.maxRows + 1),
+  ).rows;
+  const ids: number[] = [];
+  let bytes = 0;
+  for (const candidate of candidates.slice(0, budget.maxRows)) {
+    bytes += candidate.bytes ?? 0;
+    if (ids.length > 0 && bytes > budget.maxBytes) {
+      break;
+    }
+    ids.push(candidate.id);
+  }
+  if (ids.length > 0) {
+    withSqliteDatabaseWriteScope(db, [sqliteSessionIdWriteScope(sessionId)], () =>
+      executeSqliteQuerySync(
+        db,
+        kysely.deleteFrom("session_transcript_fts_rows").where("id", "in", ids),
+      ),
+    );
+  }
+  return { deletedRows: ids.length, exhausted: ids.length === candidates.length };
+}
 
 /**
  * Drains one bounded batch of a doomed session's derived projection ahead of its deletion
@@ -21,7 +64,7 @@ export function drainSessionTranscriptIndexInTransaction(
   budget: { maxRows: number; maxBytes: number },
 ): { deletedRows: number; exhausted: boolean } {
   markSessionTranscriptIndexDirtyInTransaction(db, sessionId);
-  const fts = deleteSessionTranscriptFtsRowsWithinBudgetInTransaction(db, sessionId, budget);
+  const fts = deleteSessionTranscriptFtsRowsWithinBudget(db, sessionId, budget);
   const activeBudget = budget.maxRows - fts.deletedRows;
   if (!fts.exhausted || activeBudget <= 0) {
     return { deletedRows: fts.deletedRows, exhausted: false };

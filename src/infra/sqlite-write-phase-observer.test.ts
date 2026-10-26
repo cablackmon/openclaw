@@ -13,7 +13,7 @@ function clockedRecorder() {
   const recorder = createSqliteWritePhaseRecorder(clock, () => clock);
   return {
     recorder,
-    advance(ms: number) {
+    advance: (ms: number) => {
       clock += ms;
     },
   };

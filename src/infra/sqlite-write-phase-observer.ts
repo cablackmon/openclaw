@@ -21,7 +21,7 @@ export function sqliteWritePhaseClockMs(): number {
   return Number(process.hrtime.bigint()) / 1e6;
 }
 
-export type SqliteWritePhaseSpan = {
+type SqliteWritePhaseSpan = {
   phase: SqliteWritePhase;
   startMs: number;
   endMs: number;
@@ -111,7 +111,6 @@ export function createSqliteWritePhaseRecorder(
             nativeTransactionMs += endMs - transactionStartMs;
           }
           transactionStartMs = undefined;
-          return;
         }
       }
     },
@@ -148,12 +147,15 @@ export function sqliteWritePhaseLogFields(params: {
 }) {
   const { report } = params;
   const releaseEndMs = Math.max(params.releasedAtMs ?? report.endMs, report.endMs);
-  const phasesMs = Object.fromEntries(
-    Object.entries(report.totalsMs).map(([phase, ms]) => [
-      phase,
-      roundMs(phase === "release" ? ms + releaseEndMs - report.endMs : ms),
-    ]),
-  ) as Record<SqliteWritePhase, number>;
+  const totals = report.totalsMs;
+  const phasesMs: Record<SqliteWritePhase, number> = {
+    "lease-prepare": roundMs(totals["lease-prepare"]),
+    open: roundMs(totals.open),
+    schema: roundMs(totals.schema),
+    mutation: roundMs(totals.mutation),
+    commit: roundMs(totals.commit),
+    release: roundMs(totals.release + releaseEndMs - report.endMs),
+  };
   return {
     phasesMs,
     ...(params.grantedAtMs !== undefined
