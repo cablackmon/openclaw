@@ -4,13 +4,7 @@ import { AsyncContext } from "../shared/async-context.js";
  * Fixed subphases of one coordinated write admission grant. A segment is attributed to the
  * boundary that closes it, so `release` covers everything after the final native settlement.
  */
-export type SqliteWritePhase =
-  | "lease-prepare"
-  | "open"
-  | "schema"
-  | "mutation"
-  | "commit"
-  | "release";
+type SqliteWritePhase = "lease-prepare" | "open" | "schema" | "mutation" | "commit" | "release";
 
 export type SqliteWritePhaseEvent =
   | { kind: "phase"; phase: Exclude<SqliteWritePhase, "mutation" | "commit" | "release"> }
